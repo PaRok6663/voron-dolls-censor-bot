@@ -86,6 +86,12 @@ class Database:
             cursor = await db.execute("SELECT * FROM chat_settings WHERE chat_id = ?", (chat_id,))
             row = await cursor.fetchone()
             if row:
+                if title and row["title"] != title:
+                    await db.execute("UPDATE chat_settings SET title = ? WHERE chat_id = ?", (title, chat_id))
+                    await db.commit()
+                    d = dict(row)
+                    d["title"] = title
+                    return d
                 return dict(row)
             
             # Create default settings for new chat
@@ -101,6 +107,16 @@ class Database:
             cursor = await db.execute("SELECT * FROM chat_settings WHERE chat_id = ?", (chat_id,))
             row = await cursor.fetchone()
             return dict(row) if row else {}
+
+    async def get_managed_chats(self) -> List[Dict[str, Any]]:
+        """Returns all group / channel chats registered in the bot database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM chat_settings WHERE chat_id < 0 ORDER BY created_at DESC"
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
 
     async def update_chat_setting(self, chat_id: int, key: str, value: Any):
         allowed_keys = {
