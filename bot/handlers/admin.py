@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Router, F, Bot
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -246,7 +247,10 @@ async def cb_refresh_chats(query: CallbackQuery, db: Database, settings: BotSett
 
     chats = await db.get_managed_chats()
     kb = build_chats_list_keyboard(chats)
-    await query.message.edit_reply_markup(reply_markup=kb)
+    try:
+        await query.message.edit_reply_markup(reply_markup=kb)
+    except TelegramBadRequest:
+        pass
     await query.answer("Список чатов обновлен")
 
 
@@ -287,9 +291,12 @@ async def callback_toggle(query: CallbackQuery, db: Database, settings: BotSetti
 
     updated_cfg = await db.get_chat_settings(chat_id)
     is_private = (query.message.chat.type == "private")
-    await query.message.edit_reply_markup(
-        reply_markup=build_settings_keyboard(updated_cfg, chat_id=chat_id, is_private=is_private)
-    )
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=build_settings_keyboard(updated_cfg, chat_id=chat_id, is_private=is_private)
+        )
+    except TelegramBadRequest:
+        pass
     await query.answer(f"Параметр {key}: {'ВКЛ ✅' if new_val else 'ВЫКЛ ❌'}")
 
 
@@ -314,9 +321,12 @@ async def callback_cycle_action(query: CallbackQuery, db: Database, settings: Bo
 
     updated_cfg = await db.get_chat_settings(chat_id)
     is_private = (query.message.chat.type == "private")
-    await query.message.edit_reply_markup(
-        reply_markup=build_settings_keyboard(updated_cfg, chat_id=chat_id, is_private=is_private)
-    )
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=build_settings_keyboard(updated_cfg, chat_id=chat_id, is_private=is_private)
+        )
+    except TelegramBadRequest:
+        pass
     await query.answer(f"Действие: {new_action.upper()}")
 
 
@@ -326,9 +336,12 @@ async def callback_refresh(query: CallbackQuery, db: Database):
     chat_id = int(parts[1]) if len(parts) > 1 else query.message.chat.id
     cfg = await db.get_chat_settings(chat_id)
     is_private = (query.message.chat.type == "private")
-    await query.message.edit_reply_markup(
-        reply_markup=build_settings_keyboard(cfg, chat_id=chat_id, is_private=is_private)
-    )
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=build_settings_keyboard(cfg, chat_id=chat_id, is_private=is_private)
+        )
+    except TelegramBadRequest:
+        pass
     await query.answer("Настройки обновлены")
 
 
