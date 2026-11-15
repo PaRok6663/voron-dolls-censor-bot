@@ -25,11 +25,20 @@ class Database:
                     anti_profanity INTEGER DEFAULT 1,
                     delete_service INTEGER DEFAULT 1,
                     block_media INTEGER DEFAULT 0,
+                    block_stickers INTEGER DEFAULT 0,
+                    block_spoilers INTEGER DEFAULT 0,
                     action_on_violation TEXT DEFAULT 'delete',
                     silent_mode INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Safe column migrations for existing databases
+            for col in ["block_stickers INTEGER DEFAULT 0", "block_spoilers INTEGER DEFAULT 0"]:
+                try:
+                    await db.execute(f"ALTER TABLE chat_settings ADD COLUMN {col}")
+                except Exception:
+                    pass
 
             # 2. Custom blacklist & whitelist words
             await db.execute("""
@@ -122,7 +131,8 @@ class Database:
         allowed_keys = {
             "anti_porn", "anti_spam", "anti_flood", "anti_links",
             "anti_foreign", "anti_profanity", "delete_service",
-            "block_media", "action_on_violation", "silent_mode"
+            "block_media", "block_stickers", "block_spoilers",
+            "action_on_violation", "silent_mode"
         }
         if key not in allowed_keys:
             raise ValueError(f"Invalid setting key: {key}")
