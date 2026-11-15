@@ -43,16 +43,35 @@ class MessageModerator:
         return len(valid) > self.flood_limit
 
     def extract_all_text(self, message: Message) -> str:
-        """Extracts text, caption, or poll question from a message."""
+        """Extracts text, caption, poll question, or media metadata (filenames, sticker pack) from a message."""
         parts = []
-        if message.text:
+        if getattr(message, "text", None):
             parts.append(message.text)
-        if message.caption:
+        if getattr(message, "caption", None):
             parts.append(message.caption)
-        if message.poll:
+        if getattr(message, "poll", None):
             parts.append(message.poll.question)
             for opt in message.poll.options:
                 parts.append(opt.text)
+        # Media filenames and metadata
+        doc = getattr(message, "document", None)
+        if doc and getattr(doc, "file_name", None):
+            parts.append(doc.file_name)
+        vid = getattr(message, "video", None)
+        if vid and getattr(vid, "file_name", None):
+            parts.append(vid.file_name)
+        aud = getattr(message, "audio", None)
+        if aud and getattr(aud, "file_name", None):
+            parts.append(aud.file_name)
+        anim = getattr(message, "animation", None)
+        if anim and getattr(anim, "file_name", None):
+            parts.append(anim.file_name)
+        stk = getattr(message, "sticker", None)
+        if stk:
+            if getattr(stk, "set_name", None):
+                parts.append(stk.set_name)
+            if getattr(stk, "emoji", None):
+                parts.append(stk.emoji)
         return " ".join(parts)
 
     def extract_urls_and_mentions(self, message: Message) -> Tuple[List[str], List[str]]:
@@ -139,6 +158,7 @@ class MessageModerator:
                 or message.voice
                 or message.sticker
                 or message.animation
+                or message.document
             ):
                 return ModerationResult(
                     is_violation=True,
@@ -147,17 +167,37 @@ class MessageModerator:
                     matched_detail="photo/video/sticker"
                 )
 
+        # 3.1 Block Stickers & GIFs Check (major source of 18+ porn spam)
+        if chat_settings.get("block_stickers", 0):
+            if message.sticker or message.animation:
+                return ModerationResult(
+                    is_violation=True,
+                    category="media",
+                    reason="Стикеры и GIF-анимации запрещены настройками чата",
+                    matched_detail="sticker/animation"
+                )
+
+        # 3.2 Media spoiler check (often used for blurred 18+ pictures)
+        if chat_settings.get("block_spoilers", 0) and getattr(message, "has_media_spoiler", False):
+            return ModerationResult(
+                is_violation=True,
+                category="porn",
+                reason="18+ / Скрытое медиа под спойлером",
+                matched_detail="media_spoiler"
+            )
+
         raw_text = self.extract_all_text(message)
         if not raw_text:
             return ModerationResult(is_violation=False)
 
+        raw_lower = raw_text.lower()
         norm_text = normalize_text(raw_text)
         collapsed_text = get_collapsed_text(norm_text)
 
         # Check whitelist first (if message matches custom whitelist, allow it)
         for w_word in custom_whitelist:
             w_norm = normalize_text(w_word)
-            if w_norm and w_norm in norm_text:
+            if w_norm and (w_norm in norm_text or w_norm in raw_lower):
                 return ModerationResult(is_violation=False)
 
         # 4. Foreign Scripts (Arabic, Persian, Hebrew, Devanagari spam bots)
@@ -174,7 +214,7 @@ class MessageModerator:
         if chat_settings.get("anti_porn", 1):
             # First check short bounded porn words (avoid collisions with 'канал', etc.)
             for kw_short, pat_short in SHORT_PORN_BOUNDED.items():
-                if pat_short.search(norm_text):
+                if pat_short.search(norm_text) or pat_short.search(raw_lower):
                     return ModerationResult(
                         is_violation=True,
                         category="porn",
@@ -182,13 +222,12 @@ class MessageModerator:
                         matched_detail=kw_short
                     )
 
-            # Check general porn keywords
+            # Check general porn keywords (in raw_lower, norm_text, and collapsed)
             for kw in PORN_KEYWORDS:
                 if kw in SHORT_PORN_BOUNDED:
                     continue
-                pattern = r'\b' + re.escape(kw)
-                # Word boundary match in normalized text or collapsed
-                if re.search(pattern, norm_text) or kw in collapsed_text:
+                pattern = r'(?<![а-яёa-z0-9])' + re.escape(kw) + r'(?![а-яёa-z0-9])'
+                if re.search(pattern, raw_lower) or re.search(pattern, norm_text) or kw in collapsed_text:
                     return ModerationResult(
                         is_violation=True,
                         category="porn",
@@ -261,7 +300,7 @@ class MessageModerator:
         # 8. Anti-Profanity (Russian Mat)
         if chat_settings.get("anti_profanity", 1):
             for pat in PROFANITY_PATTERNS:
-                m = pat.search(norm_text)
+                m = pat.search(norm_text) or pat.search(raw_lower)
                 if m:
                     return ModerationResult(
                         is_violation=True,
