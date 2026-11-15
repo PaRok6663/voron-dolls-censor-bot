@@ -1,3 +1,4 @@
+import io
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -8,10 +9,12 @@ from aiogram.filters import Command
 from ..database import Database
 from ..config import BotSettings
 from ..filters.moderator import MessageModerator
+from ..filters.nsfw_analyzer import NSFWAnalyzer
 
 logger = logging.getLogger(__name__)
 router = Router(name="group_moderation_router")
 moderator = MessageModerator()
+nsfw_analyzer = NSFWAnalyzer()
 
 
 async def is_sender_admin(message: Message, bot: Bot, settings: BotSettings) -> bool:
@@ -58,51 +61,75 @@ async def is_sender_admin(message: Message, bot: Bot, settings: BotSettings) -> 
 
 
 @router.message(Command("test", "check"))
-async def cmd_test_text(message: Message, db: Database, settings: BotSettings):
+async def cmd_test_text(message: Message, bot: Bot, db: Database, settings: BotSettings):
+    target_msg = message.reply_to_message or message
+    test_text = ""
     parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await message.reply("Использование: <code>/test проверяемый текст</code>", parse_mode="HTML")
-    
-    test_text = parts[1]
+    if len(parts) > 1:
+        test_text = parts[1]
+    elif message.reply_to_message:
+        test_text = moderator.extract_all_text(message.reply_to_message)
+
     chat_cfg = await db.get_chat_settings(message.chat.id)
     blacklist = await db.get_custom_words(message.chat.id, "blacklist")
     whitelist = await db.get_custom_words(message.chat.id, "whitelist")
     whitelisted_domains = await db.get_whitelisted_domains(message.chat.id)
 
-    class DummyMsg:
-        text = test_text
-        caption = None
-        entities = []
-        caption_entities = []
-        content_type = "text"
-        from_user = message.from_user
-        chat = message.chat
-        message_id = 0
-
+    # 1. Text & metadata moderation
     res = moderator.check_message(
-        message=DummyMsg(),
+        message=target_msg,
         chat_settings=chat_cfg,
         custom_blacklist=blacklist,
         custom_whitelist=whitelist,
         whitelisted_domains=whitelisted_domains
     )
 
+    # 2. Visual AI check if media present
+    visual_score = None
+    file_id = None
+    if target_msg.photo:
+        file_id = target_msg.photo[0].file_id
+    elif target_msg.video and getattr(target_msg.video, "thumbnail", None):
+        file_id = target_msg.video.thumbnail.file_id
+    elif target_msg.animation and getattr(target_msg.animation, "thumbnail", None):
+        file_id = target_msg.animation.thumbnail.file_id
+
+    if file_id:
+        try:
+            file_info = await bot.get_file(file_id)
+            file_io = io.BytesIO()
+            await bot.download_file(file_info.file_path, file_io)
+            visual_score = nsfw_analyzer.predict(file_io)
+            if visual_score >= 0.70 and not res.is_violation:
+                res = ModerationResult(
+                    is_violation=True,
+                    category="porn",
+                    reason=f"18+ / Обнаружена нагота или порнография в медиа (AI score: {visual_score:.0%})",
+                    matched_detail=f"AI NSFW: {visual_score:.2f}"
+                )
+        except Exception as e:
+            logger.warning(f"Error testing visual media: {e}")
+
+    lines = ["🔍 <b>Результат проверки:</b>\n"]
+    if test_text:
+        lines.append(f"💬 Текст: <code>{test_text[:120]}</code>")
+    if visual_score is not None:
+        lines.append(f"🖼 Визуальный AI NSFW score: <b>{visual_score:.1%}</b> (порог: 70%)")
+
     if res.is_violation:
-        reply_text = (
-            f"🔍 <b>Результат проверки цензуры:</b>\n\n"
-            f"❌ <b>НАРУШЕНИЕ ОБНАРУЖЕНО!</b>\n"
-            f"• <b>Причина:</b> {res.reason}\n"
-            f"• <b>Категория:</b> {res.category}\n"
-            f"• <b>Совпадение:</b> <code>{res.matched_detail[:80]}</code>\n"
+        lines.extend([
+            f"\n❌ <b>НАРУШЕНИЕ ОБНАРУЖЕНО!</b>",
+            f"• <b>Причина:</b> {res.reason}",
+            f"• <b>Категория:</b> {res.category}",
+            f"• <b>Совпадение:</b> <code>{res.matched_detail[:80]}</code>",
             f"• <b>Действие:</b> <code>{chat_cfg.get('action_on_violation', 'delete').upper()}</code>"
-        )
+        ])
     else:
-        reply_text = (
-            f"🔍 <b>Результат проверки цензуры:</b>\n\n"
-            f"✅ <b>Чисто (нарушений не найдено).</b>\n"
-            f"Текст проходит текущие фильтры этого чата."
-        )
-    await message.reply(reply_text, parse_mode="HTML")
+        lines.extend([
+            f"\n✅ <b>Чисто (нарушений не найдено).</b>",
+            f"Сообщение полностью проходит фильтры этого чата."
+        ])
+    await message.reply("\n".join(lines), parse_mode="HTML")
 
 
 @router.message(F.chat.type.in_({"group", "supergroup"}))
@@ -129,7 +156,7 @@ async def handle_group_message(message: Message, bot: Bot, db: Database, setting
     whitelist = await db.get_custom_words(chat_id, "whitelist")
     whitelisted_domains = await db.get_whitelisted_domains(chat_id)
 
-    # Moderate message
+    # Moderate message (text, links, patterns, metadata)
     result = moderator.check_message(
         message=message,
         chat_settings=chat_cfg,
@@ -137,6 +164,35 @@ async def handle_group_message(message: Message, bot: Bot, db: Database, setting
         custom_whitelist=whitelist,
         whitelisted_domains=whitelisted_domains
     )
+
+    # Visual NSFW AI inspection on media (photos, video thumbnails, GIF animations)
+    if not result.is_violation and chat_cfg.get("anti_porn", 1):
+        file_id = None
+        if message.photo:
+            file_id = message.photo[0].file_id
+        elif message.video and getattr(message.video, "thumbnail", None):
+            file_id = message.video.thumbnail.file_id
+        elif message.animation and getattr(message.animation, "thumbnail", None):
+            file_id = message.animation.thumbnail.file_id
+        elif message.video_note and getattr(message.video_note, "thumbnail", None):
+            file_id = message.video_note.thumbnail.file_id
+
+        if file_id:
+            try:
+                file_info = await bot.get_file(file_id)
+                file_io = io.BytesIO()
+                await bot.download_file(file_info.file_path, file_io)
+                nsfw_score = nsfw_analyzer.predict(file_io)
+                logger.info(f"Visual AI NSFW check in {chat_id} from {username}: score={nsfw_score:.2f}")
+                if nsfw_score >= 0.70:
+                    result = ModerationResult(
+                        is_violation=True,
+                        category="porn",
+                        reason=f"18+ / Обнаружена нагота или порнография в медиа (AI score: {nsfw_score:.0%})",
+                        matched_detail=f"AI NSFW score: {nsfw_score:.2f}"
+                    )
+            except Exception as e:
+                logger.warning(f"Error checking visual media for NSFW: {e}")
 
     if not result.is_violation:
         return
