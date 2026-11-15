@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from aiogram import Router, F, Bot
 from aiogram.types import Message, ChatPermissions
+from aiogram.filters import Command
 
 from ..database import Database
 from ..config import BotSettings
@@ -15,15 +16,36 @@ moderator = MessageModerator()
 
 async def is_sender_admin(message: Message, bot: Bot, settings: BotSettings) -> bool:
     """Checks if sender is admin, channel owner, or anonymous admin."""
-    # 1. Message sent on behalf of the channel itself (e.g. automatic post or admin commenting as channel)
-    if message.sender_chat and message.sender_chat.id == message.chat.id:
+    # 0. Automatic forward from the linked channel itself (the channel post appearing in comments)
+    if getattr(message, "is_automatic_forward", False):
+        return True
+
+    # 1. Message sent on behalf of the channel itself
+    if message.sender_chat and message.chat and message.sender_chat.id == message.chat.id:
         return True
 
     # 2. Check if user is in global admin list
     if message.from_user and message.from_user.id in settings.ADMIN_IDS:
         return True
 
-    # 3. Check group administrator status
+    # 3. If sender is posting on behalf of an EXTERNAL channel:
+    # Non-admins often post spam in comments from their own channels.
+    # Such messages MUST be moderated!
+    if message.sender_chat and message.chat and message.sender_chat.id != message.chat.id:
+        # Check if sender_chat is the linked channel of this group
+        try:
+            chat_info = await bot.get_chat(message.chat.id)
+            if chat_info.linked_chat_id and message.sender_chat.id == chat_info.linked_chat_id:
+                return True
+        except Exception:
+            pass
+        return False
+
+    # 4. If from_user is GroupAnonymousBot (1087968824) or Telegram (777000)
+    if message.from_user and message.from_user.id in [1087968824, 777000]:
+        return False
+
+    # 5. Check group administrator status for standard user
     if message.from_user and message.chat.type in ["group", "supergroup"]:
         try:
             member = await bot.get_chat_member(message.chat.id, message.from_user.id)
@@ -35,15 +57,70 @@ async def is_sender_admin(message: Message, bot: Bot, settings: BotSettings) -> 
     return False
 
 
+@router.message(Command("test", "check"))
+async def cmd_test_text(message: Message, db: Database, settings: BotSettings):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await message.reply("Использование: <code>/test проверяемый текст</code>", parse_mode="HTML")
+    
+    test_text = parts[1]
+    chat_cfg = await db.get_chat_settings(message.chat.id)
+    blacklist = await db.get_custom_words(message.chat.id, "blacklist")
+    whitelist = await db.get_custom_words(message.chat.id, "whitelist")
+    whitelisted_domains = await db.get_whitelisted_domains(message.chat.id)
+
+    class DummyMsg:
+        text = test_text
+        caption = None
+        entities = []
+        caption_entities = []
+        content_type = "text"
+        from_user = message.from_user
+        chat = message.chat
+        message_id = 0
+
+    res = moderator.check_message(
+        message=DummyMsg(),
+        chat_settings=chat_cfg,
+        custom_blacklist=blacklist,
+        custom_whitelist=whitelist,
+        whitelisted_domains=whitelisted_domains
+    )
+
+    if res.is_violation:
+        reply_text = (
+            f"🔍 <b>Результат проверки цензуры:</b>\n\n"
+            f"❌ <b>НАРУШЕНИЕ ОБНАРУЖЕНО!</b>\n"
+            f"• <b>Причина:</b> {res.reason}\n"
+            f"• <b>Категория:</b> {res.category}\n"
+            f"• <b>Совпадение:</b> <code>{res.matched_detail[:80]}</code>\n"
+            f"• <b>Действие:</b> <code>{chat_cfg.get('action_on_violation', 'delete').upper()}</code>"
+        )
+    else:
+        reply_text = (
+            f"🔍 <b>Результат проверки цензуры:</b>\n\n"
+            f"✅ <b>Чисто (нарушений не найдено).</b>\n"
+            f"Текст проходит текущие фильтры этого чата."
+        )
+    await message.reply(reply_text, parse_mode="HTML")
+
+
 @router.message(F.chat.type.in_({"group", "supergroup"}))
+@router.edited_message(F.chat.type.in_({"group", "supergroup"}))
+@router.channel_post()
+@router.edited_channel_post()
 async def handle_group_message(message: Message, bot: Bot, db: Database, settings: BotSettings):
     chat_id = message.chat.id
     user = message.from_user
-    user_id = user.id if user else 0
-    username = f"@{user.username}" if user and user.username else (user.full_name if user else "Аноним")
+    user_id = user.id if user else (message.sender_chat.id if message.sender_chat else 0)
+    username = f"@{user.username}" if user and user.username else (user.full_name if user else (message.sender_chat.title if message.sender_chat else "Аноним"))
+    extracted_text = moderator.extract_all_text(message)
 
-    # Admins are exempt from moderation
+    logger.info(f"Incoming message [{message.message_id}] in chat {chat_id} ({message.chat.title}) from {username} ({user_id}): {extracted_text[:60]}")
+
+    # Admins and channel posts are exempt from moderation
     if await is_sender_admin(message, bot, settings):
+        logger.info(f"Skipping admin/channel sender {username} ({user_id}) in {chat_id}")
         return
 
     # Load chat configuration & custom lists
@@ -66,14 +143,14 @@ async def handle_group_message(message: Message, bot: Bot, db: Database, setting
 
     # Violation detected!
     action_type = chat_cfg.get("action_on_violation", "delete")
-    extracted_text = moderator.extract_all_text(message)
+    logger.info(f"🚨 VIOLATION in {chat_id} from {username}: {result.reason} (matched: {result.matched_detail}) -> Action: {action_type}")
 
     # 1. Delete the offensive message
     try:
         await message.delete()
-        logger.info(f"Deleted message in chat {chat_id} from {username} ({user_id}). Reason: {result.reason}")
+        logger.info(f"Deleted message {message.message_id} in {chat_id} from {username} ({user_id})")
     except Exception as e:
-        logger.warning(f"Failed to delete message in {chat_id}: {e}")
+        logger.warning(f"Failed to delete message {message.message_id} in {chat_id}: {e}")
 
     # 2. Record to database
     await db.record_violation(
