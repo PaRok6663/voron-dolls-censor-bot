@@ -4,4 +4,6 @@ pydantic>=2.7.0
 pydantic-settings>=2.0.0
 pyyaml>=6.0.0
 aiohttp-socks>=0.10.0
-
+onnxruntime>=1.18.0
+pillow>=10.0.0
+numpy>=1.24.0
