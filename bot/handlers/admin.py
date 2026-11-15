@@ -99,8 +99,18 @@ def build_settings_keyboard(chat_settings: dict, chat_id: int, is_private: bool 
                 callback_data=f"toggle_delete_service:{chat_id}"
             ),
             InlineKeyboardButton(
-                text=f"📷 Запрет медиа: {mark(chat_settings.get('block_media', 0))}",
+                text=f"📷 Запрет всех медиа: {mark(chat_settings.get('block_media', 0))}",
                 callback_data=f"toggle_block_media:{chat_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"🎭 Запрет стикеров/GIF: {mark(chat_settings.get('block_stickers', 0))}",
+                callback_data=f"toggle_block_stickers:{chat_id}"
+            ),
+            InlineKeyboardButton(
+                text=f"👁 Блок спойлеров: {mark(chat_settings.get('block_spoilers', 0))}",
+                callback_data=f"toggle_block_spoilers:{chat_id}"
             )
         ],
         [
