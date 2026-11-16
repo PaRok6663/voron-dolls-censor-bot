@@ -1,3 +1,4 @@
+import io
 import logging
 from aiogram import Router, F, Bot
 from aiogram.types import (
@@ -12,11 +13,13 @@ from aiogram.fsm.state import State, StatesGroup
 
 from ..database import Database
 from ..config import BotSettings
-from ..filters.moderator import MessageModerator
+from ..filters.moderator import MessageModerator, ModerationResult
+from ..filters.nsfw_analyzer import NSFWAnalyzer
 
 logger = logging.getLogger(__name__)
 router = Router(name="private_dialog_router")
 moderator = MessageModerator()
+nsfw_analyzer = NSFWAnalyzer()
 
 
 class ReplyState(StatesGroup):
@@ -140,6 +143,33 @@ async def handle_private_message(message: Message, bot: Bot, db: Database, setti
         custom_whitelist=whitelist,
         whitelisted_domains=whitelisted_domains
     )
+
+    # Visual NSFW AI inspection on media in private messages
+    if not result.is_violation and chat_cfg.get("anti_porn", 1):
+        file_id = None
+        if getattr(message, "photo", None):
+            file_id = message.photo[0].file_id
+        elif getattr(message, "video", None) and getattr(message.video, "thumbnail", None):
+            file_id = message.video.thumbnail.file_id
+        elif getattr(message, "animation", None) and getattr(message.animation, "thumbnail", None):
+            file_id = message.animation.thumbnail.file_id
+
+        if file_id:
+            try:
+                file_info = await bot.get_file(file_id)
+                file_io = io.BytesIO()
+                await bot.download_file(file_info.file_path, file_io)
+                nsfw_score = nsfw_analyzer.predict(file_io)
+                logger.info(f"Visual AI NSFW check in PM from {username}: score={nsfw_score:.2f}")
+                if nsfw_score >= 0.70:
+                    result = ModerationResult(
+                        is_violation=True,
+                        category="porn",
+                        reason=f"18+ / Обнаружена нагота или порнография в медиа (AI score: {nsfw_score:.0%})",
+                        matched_detail=f"AI NSFW: {nsfw_score:.2f}"
+                    )
+            except Exception as e:
+                logger.warning(f"Error checking private media for NSFW: {e}")
 
     extracted_text = moderator.extract_all_text(message)
 
