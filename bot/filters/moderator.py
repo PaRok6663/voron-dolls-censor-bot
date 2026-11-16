@@ -125,12 +125,12 @@ class MessageModerator:
         # 1. Service messages (user join/leave/pin)
         if chat_settings.get("delete_service", 1):
             if (
-                message.new_chat_members
-                or message.left_chat_member
-                or message.pinned_message
-                or message.new_chat_title
-                or message.new_chat_photo
-                or message.delete_chat_photo
+                getattr(message, "new_chat_members", None)
+                or getattr(message, "left_chat_member", None)
+                or getattr(message, "pinned_message", None)
+                or getattr(message, "new_chat_title", None)
+                or getattr(message, "new_chat_photo", None)
+                or getattr(message, "delete_chat_photo", None)
             ):
                 return ModerationResult(
                     is_violation=True,
@@ -152,13 +152,13 @@ class MessageModerator:
         # 3. Block Media Check (if chat strictly disables media from non-admins)
         if chat_settings.get("block_media", 0):
             if (
-                message.photo
-                or message.video
-                or message.video_note
-                or message.voice
-                or message.sticker
-                or message.animation
-                or message.document
+                getattr(message, "photo", None)
+                or getattr(message, "video", None)
+                or getattr(message, "video_note", None)
+                or getattr(message, "voice", None)
+                or getattr(message, "sticker", None)
+                or getattr(message, "animation", None)
+                or getattr(message, "document", None)
             ):
                 return ModerationResult(
                     is_violation=True,
@@ -169,7 +169,7 @@ class MessageModerator:
 
         # 3.1 Block Stickers & GIFs Check (major source of 18+ porn spam)
         if chat_settings.get("block_stickers", 0):
-            if message.sticker or message.animation:
+            if getattr(message, "sticker", None) or getattr(message, "animation", None):
                 return ModerationResult(
                     is_violation=True,
                     category="media",
