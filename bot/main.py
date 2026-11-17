@@ -9,15 +9,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from .config import load_config
 from .database import Database
-from .handlers import admin, group_moderation, private_dialog
+from .handlers import admin, group_moderation, private_dialog, business
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8")
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger("CensorBot")
@@ -30,13 +29,10 @@ async def main():
     config = load_config()
 
     if not config.BOT_TOKEN or config.BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        logger.error(
-            "BOT_TOKEN is not configured! Please provide BOT_TOKEN in .env or config.yaml"
-        )
         print("\n" + "="*60)
-        print(" ОШИБКА: Не указан токен бота (BOT_TOKEN)!")
-        print(" 1. Откройте файл .env или config.yaml")
-        print(" 2. Вставьте ваш токен от @BotFather в строку BOT_TOKEN")
+        print(" [ОШИБКА] Токен бота не настроен!")
+        print(" 1. Откройте файл config.yaml или .env")
+        print(" 2. Вставьте токен вашего бота от @BotFather в BOT_TOKEN")
         print(" 3. Перезапустите бота")
         print("="*60 + "\n")
         return
@@ -44,6 +40,10 @@ async def main():
     # Initialize SQLite Database
     db = Database(config.DATABASE_PATH)
     await db.init()
+
+    # Pre-populate initial admin IDs into bot_admins table
+    for aid in config.ADMIN_IDS:
+        await db.add_bot_admin(aid, role="superadmin", added_by=0)
 
     # Detect system/environment proxy if present (e.g. for local Windows runs)
     import urllib.request
@@ -57,31 +57,47 @@ async def main():
     # Initialize Bot & Dispatcher
     bot = Bot(
         token=config.BOT_TOKEN,
-        session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        session=session
     )
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Pass dependencies to all handlers
-    dp["db"] = db
-    dp["settings"] = config
+    # Pre-warm visual NSFW model asynchronously
+    from .filters.nsfw_analyzer import NSFWAnalyzer
+    analyzer = NSFWAnalyzer()
+    asyncio.get_event_loop().run_in_executor(None, analyzer.ensure_model)
 
-    # Register handler routers
+    # Register Routers
     dp.include_router(admin.router)
+    dp.include_router(business.router)
     dp.include_router(group_moderation.router)
     dp.include_router(private_dialog.router)
 
-    # Bot info
+    # Inject dependencies
+    dp["db"] = db
+    dp["settings"] = config
+
+    # Check connection
     try:
-        bot_info = await bot.get_me()
-        logger.info(f"Bot authorized as @{bot_info.username} (ID: {bot_info.id})")
-        print(f"\n[OK] Бот запущен под ником: @{bot_info.username}")
-        print("Для остановки нажмите Ctrl+C\n")
+        me = await bot.get_me()
+        logger.info(f"Bot authorized as @{me.username} (ID: {me.id})")
     except Exception as e:
         logger.error(f"Failed to connect to Telegram API: {e}")
         return
 
-    # Delete existing webhook to run polling cleanly
+    # Delete existing webhook to run polling cleanly and specify allowed updates
+    allowed_updates = [
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "business_connection",
+        "business_message",
+        "edited_business_message",
+        "deleted_business_messages",
+        "callback_query",
+        "my_chat_member"
+    ]
     await bot.delete_webhook(drop_pending_updates=True)
 
     # Optional lightweight HTTP health-check server for free cloud hosts (Render, Koyeb, etc.)
@@ -102,9 +118,9 @@ async def main():
         await site.start()
         logger.info(f"Health-check HTTP server listening on port {port}")
 
-    # Start long polling
+    # Start long polling with business updates enabled
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=allowed_updates)
     finally:
         if runner:
             await runner.cleanup()
