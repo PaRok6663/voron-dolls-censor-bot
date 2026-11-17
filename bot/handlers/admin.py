@@ -21,10 +21,15 @@ logger = logging.getLogger(__name__)
 router = Router(name="admin_router")
 
 
-async def is_admin(message_or_query: Message | CallbackQuery, settings: BotSettings) -> bool:
+async def is_admin(message_or_query: Message | CallbackQuery, settings: BotSettings, db: Optional[Database] = None) -> bool:
     user_id = message_or_query.from_user.id
     if user_id in settings.ADMIN_IDS:
         return True
+
+    # Check database-added bot admins
+    if db:
+        if await db.is_bot_admin(user_id, settings.ADMIN_IDS):
+            return True
 
     # If in a group / supergroup, check chat administrator rights
     chat = message_or_query.message.chat if isinstance(message_or_query, CallbackQuery) else message_or_query.chat
@@ -49,6 +54,12 @@ def build_chats_list_keyboard(chats: List[dict]) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f"💬 {title}", callback_data=f"manage_chat:{cid}")
         ])
 
+    buttons.append([
+        InlineKeyboardButton(text="👥 Управление администраторами", callback_data="list_admins")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="💼 Подключить Telegram Business", callback_data="guide_business")
+    ])
     buttons.append([
         InlineKeyboardButton(text="📖 Как подключить новый чат/канал?", callback_data="guide_connect")
     ])
@@ -85,7 +96,7 @@ def build_settings_keyboard(chat_settings: dict, chat_id: int, is_private: bool 
         ],
         [
             InlineKeyboardButton(
-                text=f"🌐 Арабский/Спам-шрифт: {mark(chat_settings.get('anti_foreign', 1))}",
+                text=f"🌐 Спам-шрифт: {mark(chat_settings.get('anti_foreign', 1))}",
                 callback_data=f"toggle_anti_foreign:{chat_id}"
             ),
             InlineKeyboardButton(
@@ -124,14 +135,21 @@ def build_settings_keyboard(chat_settings: dict, chat_id: int, is_private: bool 
             )
         ],
         [
-            InlineKeyboardButton(text="📊 Статистика", callback_data=f"show_stats:{chat_id}"),
-            InlineKeyboardButton(text="📝 Стоп-слова", callback_data=f"show_words:{chat_id}")
+            InlineKeyboardButton(
+                text="📊 Статистика",
+                callback_data=f"show_stats:{chat_id}"
+            ),
+            InlineKeyboardButton(
+                text="📝 Стоп-слова",
+                callback_data=f"show_words:{chat_id}"
+            )
         ]
     ]
 
     if is_private:
         buttons.append([
-            InlineKeyboardButton(text="◀️ Назад ко всем чатам", callback_data="back_to_chats")
+            InlineKeyboardButton(text="◀️ Назад ко всем чатам", callback_data="back_to_chats"),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_settings:{chat_id}")
         ])
     else:
         buttons.append([
@@ -149,33 +167,37 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated, bot: Bot, db: Database,
         return
 
     chat = event.chat
-    title = chat.title or "Без названия"
     chat_id = chat.id
+    title = chat.title or f"Чат {chat_id}"
 
-    # Register chat in DB
-    await db.get_chat_settings(chat_id, title=title)
     logger.info(f"Bot joined new chat/channel: {title} ({chat_id})")
 
-    # Send welcome / instructions to the group
+    # Automatically register chat in database with default settings
+    await db.get_chat_settings(chat_id, title=title)
+
+    # If added to a group or supergroup, send a brief notification
     if chat.type in ["group", "supergroup"]:
         try:
             await bot.send_message(
                 chat_id,
-                f"🛡️ <b>Бот-цензор успешно подключен к чату «{title}»!</b>\n\n"
-                f"• По умолчанию включена защита от порно, спама, рекламы, левых ссылок и спам-ботов.\n"
-                f"• Чтобы настроить фильтры, отправьте команду <code>/settings</code> (доступно администраторам).\n"
-                f"• Также вы можете управлять всеми настройками прямо в личных сообщениях с ботом.",
+                f"🛡️ <b>Бот-цензор и антиспам активирован в этом чате!</b>\n\n"
+                f"Фильтры порнографии, спама, нецензурной лексики и вредоносных ссылок включены.\n"
+                f"Администраторы могут открыть панель настроек командой <code>/settings</code> прямо здесь или в личных сообщениях с ботом.",
                 parse_mode="HTML"
             )
         except Exception as e:
-            logger.debug(f"Could not send welcome message to chat {chat_id}: {e}")
+            logger.debug(f"Could not send welcome message to {chat_id}: {e}")
 
-    # Notify administrators in PM
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"⚙️ Настроить «{title}»", callback_data=f"manage_chat:{chat_id}")]
-    ])
-    for admin_id in settings.ADMIN_IDS:
+    # Notify all global bot administrators in private messages
+    all_admins = await db.get_all_bot_admins()
+    admin_id_set = set(settings.ADMIN_IDS) | {a["user_id"] for a in all_admins}
+
+    for admin_id in admin_id_set:
         try:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Настроить этот чат", callback_data=f"manage_chat:{chat_id}")],
+                [InlineKeyboardButton(text="◀️ К списку всех чатов", callback_data="back_to_chats")]
+            ])
             await bot.send_message(
                 admin_id,
                 f"🎉 <b>Бот добавлен в новый чат / канал!</b>\n"
@@ -194,7 +216,7 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated, bot: Bot, db: Database,
 
 @router.message(Command("settings", "panel", "chats"))
 async def cmd_settings(message: Message, db: Database, settings: BotSettings):
-    if not await is_admin(message, settings):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Эта команда доступна только администраторам канала/чата.")
 
     is_private = (message.chat.type == "private")
@@ -209,7 +231,8 @@ async def cmd_settings(message: Message, db: Database, settings: BotSettings):
                 "Нажмите кнопку ниже, чтобы посмотреть простую инструкцию по подключению 👇"
             )
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📖 Как подключить канал/чат?", callback_data="guide_connect")]
+                [InlineKeyboardButton(text="📖 Как подключить канал/чат?", callback_data="guide_connect")],
+                [InlineKeyboardButton(text="👥 Управление администраторами", callback_data="list_admins")]
             ])
             return await message.reply(text, reply_markup=kb, parse_mode="HTML")
 
@@ -228,31 +251,36 @@ async def cmd_settings(message: Message, db: Database, settings: BotSettings):
 
     text = (
         f"⚙️ <b>Панель управления цензурой и антиспамом</b>\n"
-        f"💬 Чат: <b>{chat_title}</b> (<code>{chat_id}</code>)\n\n"
-        f"Нажмите на кнопку, чтобы включить/выключить нужный фильтр:"
+        f"Чат: <b>{chat_title}</b> (<code>{chat_id}</code>)\n\n"
+        f"Нажмите на нужную кнопку ниже для мгновенного переключения параметра:"
     )
     kb = build_settings_keyboard(cfg, chat_id=chat_id, is_private=False)
     await message.reply(text, reply_markup=kb, parse_mode="HTML")
 
 
+# ---------------- Navigation Callbacks ---------------- #
+
 @router.callback_query(F.data == "back_to_chats")
 async def cb_back_to_chats(query: CallbackQuery, db: Database, settings: BotSettings):
-    if not await is_admin(query, settings):
+    if not await is_admin(query, settings, db):
         return await query.answer("⛔ Недостаточно прав!", show_alert=True)
 
     chats = await db.get_managed_chats()
     kb = build_chats_list_keyboard(chats)
     text = (
         "⚙️ <b>Центр управления каналами и чатами</b>\n\n"
-        "Выберите чат или канал для настройки:"
+        "Выберите подключенный чат или канал для индивидуальной настройки:"
     )
-    await query.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
     await query.answer()
 
 
 @router.callback_query(F.data == "refresh_chats")
 async def cb_refresh_chats(query: CallbackQuery, db: Database, settings: BotSettings):
-    if not await is_admin(query, settings):
+    if not await is_admin(query, settings, db):
         return await query.answer("⛔ Недостаточно прав!", show_alert=True)
 
     chats = await db.get_managed_chats()
@@ -266,37 +294,202 @@ async def cb_refresh_chats(query: CallbackQuery, db: Database, settings: BotSett
 
 @router.callback_query(F.data.startswith("manage_chat:"))
 async def cb_manage_chat(query: CallbackQuery, db: Database, settings: BotSettings):
-    if not await is_admin(query, settings):
+    if not await is_admin(query, settings, db):
         return await query.answer("⛔ Недостаточно прав!", show_alert=True)
 
     chat_id = int(query.data.split(":")[1])
     cfg = await db.get_chat_settings(chat_id)
-    title = cfg.get("title") or f"Чат {chat_id}"
+    chat_title = cfg.get("title") or f"Чат {chat_id}"
 
     text = (
-        f"⚙️ <b>Настройки фильтрации для:</b>\n"
-        f"💬 <b>{title}</b> (<code>{chat_id}</code>)\n\n"
-        f"Нажмите на кнопку, чтобы изменить параметр:"
+        f"⚙️ <b>Настройки фильтрации для чата:</b>\n"
+        f"📍 <b>{chat_title}</b> (ID: <code>{chat_id}</code>)\n\n"
+        f"Нажмите на кнопку, чтобы включить или выключить нужный фильтр:"
     )
-    is_private = (query.message.chat.type == "private")
-    kb = build_settings_keyboard(cfg, chat_id=chat_id, is_private=is_private)
-    await query.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    kb = build_settings_keyboard(cfg, chat_id=chat_id, is_private=True)
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
     await query.answer()
 
 
-@router.callback_query(F.data.startswith("toggle_"))
-async def callback_toggle(query: CallbackQuery, db: Database, settings: BotSettings):
-    if not await is_admin(query, settings):
+# ---------------- Connection Guide Callbacks ---------------- #
+
+@router.callback_query(F.data == "guide_connect")
+async def cb_guide_connect(query: CallbackQuery):
+    text = (
+        "📖 <b>Инструкция по подключению любого канала или группы</b>\n\n"
+        "Вы можете подключить к этому боту любое количество каналов и групп:\n\n"
+        "<b>1. Для комментариев под постами канала:</b>\n"
+        "• Откройте настройки канала в Telegram → <b>«Обсуждение»</b> (привяжите группу для комментариев, если её нет).\n"
+        "• Перейдите в эту группу обсуждений → <b>«Администраторы»</b> → <b>«Добавить администратора»</b>.\n"
+        "• Найдите юзернейм вашего бота и добавьте с правами:\n"
+        "  ✅ <i>Удаление сообщений</i>\n"
+        "  ✅ <i>Блокировка пользователей</i>\n\n"
+        "<b>2. Для защиты самого канала от спам-постов:</b>\n"
+        "• Зайдите в канал → <b>«Администраторы»</b> → добавьте бота администратором с правом публикации и удаления постов.\n\n"
+        "<b>3. Для защиты личных сообщений (Telegram Business):</b>\n"
+        "• Нажмите кнопку ниже <b>«💼 Подключить Telegram Business»</b>.\n\n"
+        "После добавления чат автоматически появится в меню <code>/settings</code>!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💼 Как подключить Telegram Business?", callback_data="guide_business")],
+        [InlineKeyboardButton(text="◀️ Назад к списку чатов", callback_data="back_to_chats")]
+    ])
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+    await query.answer()
+
+
+@router.callback_query(F.data == "guide_business")
+async def cb_guide_business(query: CallbackQuery, bot: Bot):
+    bot_info = await bot.get_me()
+    text = (
+        "💼 <b>Как подключить защиту личных сообщений через Telegram Business:</b>\n\n"
+        "Если у вас есть подписка Telegram Premium / Business, вы можете подключить бота к вашему личному аккаунту для автоматической чистки спама в ЛС:\n\n"
+        "1. Откройте в Telegram: <b>«Настройки» → «Telegram для бизнеса»</b>.\n"
+        "2. Выберите пункт <b>«Чат-боты»</b>.\n"
+        f"3. В поле поиска введите юзернейм бота: <code>@{bot_info.username}</code>.\n"
+        "4. Выберите нужные чаты (например, «Все новые чаты» или «Все ЛС кроме контактов»).\n"
+        "5. Включите разрешение <b>«Управление сообщениями»</b> (чтобы бот мог удалять спам).\n\n"
+        "✨ <b>Готово!</b> Как только бот будет подключен, он пришлет вам подтверждение в ЛС, и все входящие сообщения в вашем профиле будут автоматически защищены от спама и порнографии."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к списку чатов", callback_data="back_to_chats")]
+    ])
+    try:
+        await query.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+    await query.answer()
+
+
+# ---------------- Multi-Admin Management ---------------- #
+
+@router.callback_query(F.data == "list_admins")
+async def cb_list_admins(query: CallbackQuery, db: Database, settings: BotSettings):
+    if not await is_admin(query, settings, db):
         return await query.answer("⛔ Недостаточно прав!", show_alert=True)
 
-    # Format: toggle_anti_porn:chat_id or toggle_anti_porn
-    parts = query.data.split(":")
-    key = parts[0].replace("toggle_", "")
-    chat_id = int(parts[1]) if len(parts) > 1 else query.message.chat.id
+    db_admins = await db.get_all_bot_admins()
+    
+    text_lines = [
+        "👥 <b>Управление администраторами бота</b>\n",
+        "Администраторы могут открывать меню <code>/settings</code>, настраивать любые подключенные каналы и добавлять свои чаты.\n",
+        "<b>Владельцы из конфигурации (Superadmin):</b>"
+    ]
+    for uid in settings.ADMIN_IDS:
+        text_lines.append(f"• ID: <code>{uid}</code> (Config)")
+
+    text_lines.append("\n<b>Дополнительные администраторы:</b>")
+    if db_admins:
+        for a in db_admins:
+            name = a.get("username") or a.get("full_name") or f"ID {a['user_id']}"
+            text_lines.append(f"• <b>{name}</b> (<code>{a['user_id']}</code>) — роль: {a.get('role', 'admin')}")
+    else:
+        text_lines.append("<i>Пока нет дополнительных администраторов.</i>")
+
+    text_lines.append(
+        "\n<b>Команды для управления:</b>\n"
+        "• <code>/addadmin [user_id]</code> — Добавить администратора\n"
+        "• <code>/deladmin [user_id]</code> — Удалить администратора\n"
+        "• <code>/admins</code> — Список всех администраторов"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к списку чатов", callback_data="back_to_chats")]
+    ])
+    try:
+        await query.message.edit_text("\n".join(text_lines), reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+    await query.answer()
+
+
+@router.message(Command("addadmin"))
+async def cmd_add_admin(message: Message, db: Database, settings: BotSettings):
+    # Only superadmins (from config) or existing admins can add new admins
+    if not await is_admin(message, settings, db):
+        return await message.reply("⛔ Недостаточно прав для добавления администраторов.")
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        return await message.reply(
+            "Использование: <code>/addadmin [Telegram ID пользователя]</code>\n\n"
+            "<i>(Узнать свой Telegram ID можно у бота @userinfobot)</i>",
+            parse_mode="HTML"
+        )
+
+    new_admin_id = int(parts[1].strip())
+    await db.add_bot_admin(
+        user_id=new_admin_id,
+        role="admin",
+        added_by=message.from_user.id
+    )
+
+    await message.reply(
+        f"✅ Пользователь с ID <code>{new_admin_id}</code> успешно добавлен в администраторы бота!\n\n"
+        f"Теперь он может зайти в ЛС к боту, нажать <code>/start</code> или <code>/settings</code> и настраивать каналы.",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("deladmin"))
+async def cmd_del_admin(message: Message, db: Database, settings: BotSettings):
+    if not await is_admin(message, settings, db):
+        return await message.reply("⛔ Недостаточно прав.")
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        return await message.reply("Использование: <code>/deladmin [Telegram ID пользователя]</code>", parse_mode="HTML")
+
+    target_id = int(parts[1].strip())
+    if target_id in settings.ADMIN_IDS:
+        return await message.reply("⛔ Нельзя удалить главного супер-администратора из файла конфигурации.")
+
+    await db.remove_bot_admin(target_id)
+    await message.reply(f"✅ Администратор с ID <code>{target_id}</code> удален из бота.", parse_mode="HTML")
+
+
+@router.message(Command("admins"))
+async def cmd_list_admins(message: Message, db: Database, settings: BotSettings):
+    if not await is_admin(message, settings, db):
+        return await message.reply("⛔ Доступно только администраторам.")
+
+    db_admins = await db.get_all_bot_admins()
+    lines = ["👥 <b>Список администраторов бота:</b>\n", "<b>Главные администраторы:</b>"]
+    for uid in settings.ADMIN_IDS:
+        lines.append(f"• ID: <code>{uid}</code> (Config)")
+
+    lines.append("\n<b>Добавленные администраторы:</b>")
+    if db_admins:
+        for a in db_admins:
+            name = a.get("username") or a.get("full_name") or f"ID {a['user_id']}"
+            lines.append(f"• <b>{name}</b> (<code>{a['user_id']}</code>)")
+    else:
+        lines.append("<i>Нет</i>")
+
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
+
+# ---------------- Settings Interactive Toggles ---------------- #
+
+@router.callback_query(F.data.startswith("toggle_"))
+async def callback_toggle(query: CallbackQuery, db: Database, settings: BotSettings):
+    if not await is_admin(query, settings, db):
+        return await query.answer("⛔ Недостаточно прав!", show_alert=True)
+
+    data = query.data.replace("toggle_", "")
+    key, chat_id_str = data.split(":")
+    chat_id = int(chat_id_str)
 
     cfg = await db.get_chat_settings(chat_id)
-    curr_val = cfg.get(key, 1)
-    new_val = 0 if curr_val else 1
+    current_val = cfg.get(key, 0)
+    new_val = 0 if current_val else 1
+
     await db.update_chat_setting(chat_id, key, new_val)
 
     updated_cfg = await db.get_chat_settings(chat_id)
@@ -310,23 +503,22 @@ async def callback_toggle(query: CallbackQuery, db: Database, settings: BotSetti
     await query.answer(f"Параметр {key}: {'ВКЛ ✅' if new_val else 'ВЫКЛ ❌'}")
 
 
-@router.callback_query(F.data.startswith("cycle_action"))
+@router.callback_query(F.data.startswith("cycle_action:"))
 async def callback_cycle_action(query: CallbackQuery, db: Database, settings: BotSettings):
-    if not await is_admin(query, settings):
+    if not await is_admin(query, settings, db):
         return await query.answer("⛔ Недостаточно прав!", show_alert=True)
 
-    parts = query.data.split(":")
-    chat_id = int(parts[1]) if len(parts) > 1 else query.message.chat.id
-
-    cfg = await db.get_chat_settings(chat_id)
+    chat_id = int(query.data.split(":")[1])
     actions = ["delete", "warn", "mute_1h", "mute_24h", "ban"]
-    curr = cfg.get("action_on_violation", "delete")
-    try:
-        next_idx = (actions.index(curr) + 1) % len(actions)
-    except ValueError:
-        next_idx = 0
+    cfg = await db.get_chat_settings(chat_id)
+    current_action = cfg.get("action_on_violation", "delete")
 
-    new_action = actions[next_idx]
+    try:
+        idx = actions.index(current_action)
+        new_action = actions[(idx + 1) % len(actions)]
+    except ValueError:
+        new_action = "delete"
+
     await db.update_chat_setting(chat_id, "action_on_violation", new_action)
 
     updated_cfg = await db.get_chat_settings(chat_id)
@@ -337,13 +529,15 @@ async def callback_cycle_action(query: CallbackQuery, db: Database, settings: Bo
         )
     except TelegramBadRequest:
         pass
-    await query.answer(f"Действие: {new_action.upper()}")
+    await query.answer(f"Наказание: {new_action.upper()}")
 
 
-@router.callback_query(F.data.startswith("refresh_settings"))
-async def callback_refresh(query: CallbackQuery, db: Database):
-    parts = query.data.split(":")
-    chat_id = int(parts[1]) if len(parts) > 1 else query.message.chat.id
+@router.callback_query(F.data.startswith("refresh_settings:"))
+async def callback_refresh(query: CallbackQuery, db: Database, settings: BotSettings):
+    if not await is_admin(query, settings, db):
+        return await query.answer("⛔ Недостаточно прав!", show_alert=True)
+
+    chat_id = int(query.data.split(":")[1])
     cfg = await db.get_chat_settings(chat_id)
     is_private = (query.message.chat.type == "private")
     try:
@@ -355,223 +549,170 @@ async def callback_refresh(query: CallbackQuery, db: Database):
     await query.answer("Настройки обновлены")
 
 
-@router.callback_query(F.data.startswith("show_stats"))
-async def callback_stats(query: CallbackQuery, db: Database):
-    parts = query.data.split(":")
-    chat_id = int(parts[1]) if len(parts) > 1 else query.message.chat.id
-    cfg = await db.get_chat_settings(chat_id)
-    title = cfg.get("title") or f"Чат {chat_id}"
+@router.callback_query(F.data.startswith("show_stats:"))
+async def callback_stats(query: CallbackQuery, db: Database, settings: BotSettings):
+    if not await is_admin(query, settings, db):
+        return await query.answer("⛔ Недостаточно прав!", show_alert=True)
 
+    chat_id = int(query.data.split(":")[1])
     stats = await db.get_chat_stats(chat_id)
-    lines = [
-        f"📊 <b>Статистика фильтрации для «{title}»:</b>",
-        f"Всего заблокировано спама: <b>{stats['total_deleted']}</b>"
-    ]
+    lines = [f"📊 <b>Статистика чата {chat_id}:</b>\n", f"Всего заблокировано нарушений: <b>{stats['total_actions']}</b>"]
     if stats["top_reasons"]:
-        lines.append("\n<b>Топ нарушений:</b>")
+        lines.append("\n<b>Топ причин:</b>")
         for reason, count in stats["top_reasons"]:
             lines.append(f"• {reason}: {count}")
 
-    await query.answer()
     await query.message.reply("\n".join(lines), parse_mode="HTML")
-
-
-@router.callback_query(F.data.startswith("show_words"))
-async def callback_words(query: CallbackQuery, db: Database):
-    parts = query.data.split(":")
-    chat_id = int(parts[1]) if len(parts) > 1 else query.message.chat.id
-    cfg = await db.get_chat_settings(chat_id)
-    title = cfg.get("title") or f"Чат {chat_id}"
-
-    bl = await db.get_custom_words(chat_id, "blacklist")
-    wl = await db.get_whitelisted_domains(chat_id)
-    bl_str = ", ".join(bl) if bl else "<i>(пусто)</i>"
-    wl_str = ", ".join(wl) if wl else "<i>(пусто)</i>"
-
-    text = (
-        f"📝 <b>Фильтры слов для «{title}»:</b>\n\n"
-        f"🚫 <b>Черный список слов:</b>\n{bl_str}\n\n"
-        f"Добавить: <code>/addword слово</code>\n"
-        f"Удалить: <code>/delword слово</code>\n\n"
-        f"✅ <b>Белый список ссылок:</b>\n{wl_str}\n\n"
-        f"Добавить: <code>/addwhitelist ссылка</code>\n"
-        f"Удалить: <code>/delwhitelist ссылка</code>"
-    )
     await query.answer()
+
+
+@router.callback_query(F.data.startswith("show_words:"))
+async def callback_words(query: CallbackQuery, db: Database, settings: BotSettings):
+    if not await is_admin(query, settings, db):
+        return await query.answer("⛔ Недостаточно прав!", show_alert=True)
+
+    chat_id = int(query.data.split(":")[1])
+    words = await db.get_custom_words(chat_id, "blacklist")
+    if not words:
+        text = (
+            f"📝 В чате <code>{chat_id}</code> нет дополнительных стоп-слов.\n"
+            f"Чтобы добавить: <code>/addword слово</code>"
+        )
+    else:
+        text = f"📝 <b>Стоп-слова для чата {chat_id}:</b>\n" + ", ".join(f"<code>{w}</code>" for w in words)
+
     await query.message.reply(text, parse_mode="HTML")
-
-
-@router.callback_query(F.data == "guide_connect")
-async def cb_guide_connect(query: CallbackQuery):
-    guide_text = (
-        "📖 <b>Пошаговая инструкция: как подключить бота к любому каналу или чату</b>\n\n"
-        "<b>Вариант А: Защита комментариев канала (например, Voron Dolls)</b>\n"
-        "1. Зайдите в ваш Telegram-канал → <b>Управление каналом</b> → раздел <b>«Обсуждение»</b>.\n"
-        "2. Убедитесь, что к каналу привязана группа для комментариев (если нет — создайте или привяжите существующую).\n"
-        "3. Откройте эту привязанную группу → нажмите <b>Добавить участников</b> → найдите бота <code>@voron_dolls_censor_bot</code>.\n"
-        "4. Назначьте бота <b>Администратором группы</b> со следующими правами:\n"
-        "   ✅ <i>Удаление сообщений (Delete Messages)</i>\n"
-        "   ✅ <i>Блокировка пользователей (Ban Users)</i>\n"
-        "5. <b>Готово!</b> Бот сразу начнет фильтровать комментарии под постами канала и появится в вашем списке <code>/settings</code>.\n\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        "<b>Вариант Б: Подключение к любой обычной группе / чату</b>\n"
-        "• Просто добавьте бота в нужную группу и дайте права Администратора на удаление сообщений.\n\n"
-        "💡 <i>Вы можете подключить одного и того же бота к 10, 20 и более разным каналам и группам — каждый настраивается независимо!</i>"
-    )
     await query.answer()
-    await query.message.reply(guide_text, parse_mode="HTML")
 
 
-# ---------------- Custom Words Management ---------------- #
+# ---------------- Custom Words and Whitelist Commands ---------------- #
 
 @router.message(Command("addword"))
-async def cmd_addword(message: Message, db: Database, settings: BotSettings):
-    if not await is_admin(message, settings):
+async def cmd_add_word(message: Message, db: Database, settings: BotSettings):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await message.reply("Использование: <code>/addword запрещенное_слово</code>", parse_mode="HTML")
+        return await message.reply("Использование: <code>/addword [слово]</code>", parse_mode="HTML")
 
     word = parts[1].strip()
-    success = await db.add_custom_word(message.chat.id, word, "blacklist")
-    if success:
-        await message.reply(f"✅ Слово <b>«{word}»</b> добавлено в черный список этого чата.", parse_mode="HTML")
-    else:
-        await message.reply("⚠️ Это слово уже есть в черном списке.")
+    await db.add_custom_word(message.chat.id, word, "blacklist")
+    await message.reply(f"✅ Слово <code>{word}</code> добавлено в черный список этого чата.", parse_mode="HTML")
 
 
 @router.message(Command("delword"))
-async def cmd_delword(message: Message, db: Database, settings: BotSettings):
-    if not await is_admin(message, settings):
+async def cmd_del_word(message: Message, db: Database, settings: BotSettings):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await message.reply("Использование: <code>/delword слово</code>", parse_mode="HTML")
+        return await message.reply("Использование: <code>/delword [слово]</code>", parse_mode="HTML")
 
     word = parts[1].strip()
-    success = await db.remove_custom_word(message.chat.id, word, "blacklist")
-    if success:
-        await message.reply(f"🗑 Слово <b>«{word}»</b> удалено из черного списка.", parse_mode="HTML")
-    else:
-        await message.reply("⚠️ Слово не найдено в черном списке.")
+    await db.remove_custom_word(message.chat.id, word, "blacklist")
+    await message.reply(f"✅ Слово <code>{word}</code> удалено из черного списка этого чата.", parse_mode="HTML")
 
 
-@router.message(Command("words", "blacklist"))
-async def cmd_words(message: Message, db: Database, settings: BotSettings):
-    if not await is_admin(message, settings):
+@router.message(Command("words"))
+async def cmd_list_words(message: Message, db: Database, settings: BotSettings):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
 
     words = await db.get_custom_words(message.chat.id, "blacklist")
     if not words:
-        return await message.reply("📝 Черный список слов пуст.")
-    
-    text = "🚫 <b>Черный список слов:</b>\n" + "\n".join(f"• {w}" for w in words)
+        return await message.reply("В черном списке этого чата пока нет добавленных слов.")
+
+    text = "📝 <b>Черный список слов этого чата:</b>\n" + ", ".join(f"<code>{w}</code>" for w in words)
     await message.reply(text, parse_mode="HTML")
 
 
 @router.message(Command("addwhitelist"))
-async def cmd_addwhitelist(message: Message, db: Database, settings: BotSettings):
-    if not await is_admin(message, settings):
+async def cmd_add_whitelist(message: Message, db: Database, settings: BotSettings):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await message.reply("Использование: <code>/addwhitelist домен_или_ник</code>\nПример: <code>/addwhitelist vorondolls</code> или <code>/addwhitelist vk.com</code>", parse_mode="HTML")
+        return await message.reply("Использование: <code>/addwhitelist [домен или канал]</code> (например: <code>t.me/vorondolls</code>)", parse_mode="HTML")
 
-    domain = parts[1].strip().lower().replace("https://", "").replace("http://", "").rstrip('/')
-    success = await db.add_whitelisted_domain(message.chat.id, domain)
-    if success:
-        await message.reply(f"✅ Домен/ссылка <b>«{domain}»</b> добавлена в белый список.", parse_mode="HTML")
-    else:
-        await message.reply("⚠️ Этот домен уже в белом списке.")
+    domain = parts[1].strip()
+    await db.add_whitelisted_domain(message.chat.id, domain)
+    await message.reply(f"✅ Ссылка <code>{domain}</code> добавлена в белый список этого чата.", parse_mode="HTML")
 
 
 @router.message(Command("delwhitelist"))
-async def cmd_delwhitelist(message: Message, db: Database, settings: BotSettings):
-    if not await is_admin(message, settings):
+async def cmd_del_whitelist(message: Message, db: Database, settings: BotSettings):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        return await message.reply("Использование: <code>/delwhitelist домен</code>", parse_mode="HTML")
+        return await message.reply("Использование: <code>/delwhitelist [домен]</code>", parse_mode="HTML")
 
-    domain = parts[1].strip().lower()
-    success = await db.remove_whitelisted_domain(message.chat.id, domain)
-    if success:
-        await message.reply(f"🗑 <b>«{domain}»</b> удален из белого списка.", parse_mode="HTML")
-    else:
-        await message.reply("⚠️ Домен не найден в белом списке.")
+    domain = parts[1].strip()
+    await db.remove_whitelisted_domain(message.chat.id, domain)
+    await message.reply(f"✅ Ссылка <code>{domain}</code> удалена из белого списка.", parse_mode="HTML")
 
 
 @router.message(Command("whitelist"))
-async def cmd_whitelist(message: Message, db: Database, settings: BotSettings):
-    if not await is_admin(message, settings):
+async def cmd_list_whitelist(message: Message, db: Database, settings: BotSettings):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
 
     domains = await db.get_whitelisted_domains(message.chat.id)
     if not domains:
-        return await message.reply("✅ Белый список ссылок пуст.")
-    
-    text = "✅ <b>Белый список разрешенных доменов/ссылок:</b>\n" + "\n".join(f"• {d}" for d in domains)
+        return await message.reply("Белый список ссылок этого чата пуст.")
+
+    text = "🔗 <b>Разрешенные ссылки и домены этого чата:</b>\n" + "\n".join(f"• <code>{d}</code>" for d in domains)
     await message.reply(text, parse_mode="HTML")
 
 
-# ---------------- Manual Admin Commands: Ban, Mute, Unmute ---------------- #
-
-@router.message(Command("ban"))
-async def cmd_ban(message: Message, settings: BotSettings):
-    if not await is_admin(message, settings):
-        return await message.reply("⛔ Только для администраторов.")
-    
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        return await message.reply("⚠️ Ответьте этой командой на сообщение нарушителя, которого хотите забанить.")
-
-    target = message.reply_to_message.from_user
-    try:
-        await message.chat.ban_chat_member(target.id)
-        await message.reply(f"🚫 Пользователь <b>{target.full_name}</b> (<code>{target.id}</code>) заблокирован.", parse_mode="HTML")
-    except Exception as e:
-        await message.reply(f"❌ Не удалось забанить: {e}")
-
+# ---------------- Manual Moderation Commands ---------------- #
 
 @router.message(Command("mute"))
-async def cmd_mute(message: Message, settings: BotSettings):
-    if not await is_admin(message, settings):
+async def cmd_mute(message: Message, bot: Bot, settings: BotSettings, db: Database):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
-    
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        return await message.reply("⚠️ Ответьте на сообщение пользователя: <code>/mute 60</code> (на 60 минут)", parse_mode="HTML")
+
+    if not message.reply_to_message:
+        return await message.reply("Команда должна быть ответом на сообщение нарушителя!")
+
+    target = message.reply_to_message.from_user
+    if not target:
+        return await message.reply("Не удалось определить пользователя.")
 
     parts = message.text.split()
-    minutes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 60
+    minutes = 60
+    if len(parts) > 1 and parts[1].isdigit():
+        minutes = int(parts[1])
 
-    target = message.reply_to_message.from_user
-    until_date = datetime.now() + timedelta(minutes=minutes)
-
+    until = datetime.now() + timedelta(minutes=minutes)
     try:
-        await message.chat.restrict(
+        await bot.restrict_chat_member(
+            chat_id=message.chat.id,
             user_id=target.id,
             permissions=ChatPermissions(can_send_messages=False),
-            until_date=until_date
+            until_date=until
         )
-        await message.reply(f"🔇 Пользователь <b>{target.full_name}</b> переведен в режим только для чтения на {minutes} мин.", parse_mode="HTML")
+        await message.reply(f"🔇 Пользователь <b>{target.full_name}</b> замучен на <b>{minutes}</b> мин.", parse_mode="HTML")
     except Exception as e:
-        await message.reply(f"❌ Ошибка мута: {e}")
+        await message.reply(f"❌ Не удалось выдать мут: {e}")
 
 
-@router.message(Command("unmute", "unban"))
-async def cmd_unmute(message: Message, settings: BotSettings):
-    if not await is_admin(message, settings):
+@router.message(Command("unmute"))
+async def cmd_unmute(message: Message, bot: Bot, settings: BotSettings, db: Database):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
-    
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        return await message.reply("⚠️ Ответьте на сообщение пользователя.")
+
+    if not message.reply_to_message:
+        return await message.reply("Команда должна быть ответом на сообщение пользователя.")
 
     target = message.reply_to_message.from_user
     try:
-        await message.chat.restrict(
+        await bot.restrict_chat_member(
+            chat_id=message.chat.id,
             user_id=target.id,
             permissions=ChatPermissions(
                 can_send_messages=True,
@@ -580,18 +721,34 @@ async def cmd_unmute(message: Message, settings: BotSettings):
                 can_add_web_page_previews=True
             )
         )
-        await message.reply(f"🔊 Ограничения с пользователя <b>{target.full_name}</b> сняты.", parse_mode="HTML")
+        await message.reply(f"🔊 Мут с пользователя <b>{target.full_name}</b> снят.", parse_mode="HTML")
     except Exception as e:
         await message.reply(f"❌ Ошибка: {e}")
 
 
+@router.message(Command("ban"))
+async def cmd_ban(message: Message, bot: Bot, settings: BotSettings, db: Database):
+    if not await is_admin(message, settings, db):
+        return await message.reply("⛔ Только для администраторов.")
+
+    if not message.reply_to_message:
+        return await message.reply("Команда должна быть ответом на сообщение нарушителя!")
+
+    target = message.reply_to_message.from_user
+    try:
+        await bot.ban_chat_member(chat_id=message.chat.id, user_id=target.id)
+        await message.reply(f"⛔ Пользователь <b>{target.full_name}</b> заблокирован.", parse_mode="HTML")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка при блокировке: {e}")
+
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message, db: Database, settings: BotSettings):
-    if not await is_admin(message, settings):
+    if not await is_admin(message, settings, db):
         return await message.reply("⛔ Только для администраторов.")
 
     stats = await db.get_chat_stats(message.chat.id)
-    lines = [f"📊 <b>Статистика фильтрации:</b>", f"Всего удалено спама: <b>{stats['total_deleted']}</b>"]
+    lines = [f"📊 <b>Статистика фильтрации:</b>", f"Всего удалено спама: <b>{stats['total_actions']}</b>"]
     if stats["top_reasons"]:
         lines.append("\n<b>Топ причин нарушений:</b>")
         for reason, count in stats["top_reasons"]:
@@ -601,15 +758,18 @@ async def cmd_stats(message: Message, db: Database, settings: BotSettings):
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message, settings: BotSettings):
-    is_adm = await is_admin(message, settings)
+async def cmd_help(message: Message, settings: BotSettings, db: Database):
+    is_adm = await is_admin(message, settings, db)
     
     if message.chat.type == "private" and is_adm:
         text = (
             "🤖 <b>Панель управления ботом-цензором и антиспамом</b>\n\n"
-            "Этот бот защищает комментарии и личные сообщения любых ваших каналов и групп.\n\n"
+            "Этот бот защищает комментарии и личные сообщения любых ваших каналов, групп и бизнес-аккаунтов.\n\n"
             "<b>Основные разделы:</b>\n"
             "• <code>/settings</code> или <code>/chats</code> — Выбрать чат / канал для настройки\n"
+            "• <code>/admins</code> — Список администраторов бота\n"
+            "• <code>/addadmin [user_id]</code> — Добавить нового администратора\n"
+            "• <code>/deladmin [user_id]</code> — Удалить администратора\n"
             "• <code>/help</code> — Эта справка\n\n"
             "<b>Ручное управление в чате:</b>\n"
             "• <code>/addword [слово]</code> — Добавить слово в черный список\n"
@@ -625,6 +785,7 @@ async def cmd_help(message: Message, settings: BotSettings):
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⚙️ Выбрать чат / канал для настройки", callback_data="back_to_chats")],
+            [InlineKeyboardButton(text="👥 Управление администраторами", callback_data="list_admins")],
             [InlineKeyboardButton(text="📖 Как подключить новый чат/канал?", callback_data="guide_connect")]
         ])
         return await message.reply(text, reply_markup=kb, parse_mode="HTML")
